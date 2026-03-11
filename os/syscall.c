@@ -693,6 +693,28 @@ void *do_fork(void *arg)
 }
 
 /*
+    - wakes up all readers up to MAX_PROCS(8)
+*/
+static void pipe_broadcast_readers(Pipe *p)
+{
+    int i;
+    for (i = 0; i < PIPE_WAKE_BROADCAST; i++) {
+        V_kt_sem(p->data_sem);   // wake readers blocked on empty pipe
+    }
+}
+
+/*
+    - wakes up all writers up to MAX_PROCS(8)
+*/
+static void pipe_broadcast_writers(Pipe *p)
+{
+    int i;
+    for (i = 0; i < PIPE_WAKE_BROADCAST; i++) {
+        V_kt_sem(p->space_sem);  // wake writers blocked on full pipe
+    }
+}
+
+/*
     - internal close primitive: no SysCallReturn, reusable by do_close/do_exit/dup2
 */
 static int close_fd_internal(struct PCB_struct *pcb, int fd)
@@ -884,28 +906,6 @@ void *do_getdtablesize(void *arg)
     struct PCB_struct *pcb = (struct PCB_struct *)arg;
     SysCallReturn(pcb, 64);
     return NULL;
-}
-
-/*
-    - wakes up all readers up to MAX_PROCS(8)
-*/
-static void pipe_broadcast_readers(Pipe *p)
-{
-    int i;
-    for (i = 0; i < PIPE_WAKE_BROADCAST; i++) {
-        V_kt_sem(p->data_sem);   // wake readers blocked on empty pipe
-    }
-}
-
-/*
-    - wakes up all writers up to MAX_PROCS(8)
-*/
-static void pipe_broadcast_writers(Pipe *p)
-{
-    int i;
-    for (i = 0; i < PIPE_WAKE_BROADCAST; i++) {
-        V_kt_sem(p->space_sem);  // wake writers blocked on full pipe
-    }
 }
 
 /*
