@@ -1142,12 +1142,230 @@ void *do_pipe(void *arg)
 
 void *do_dup(void *arg)
 {
-    (void)arg;
+    struct PCB_struct *pcb = (struct PCB_struct *)arg;
+    int oldfd = pcb->registers[5];
+
+    // validating oldfd
+    if (oldfd < 0 || oldfd >= MAX_FD || pcb->fds[oldfd].in_use == 0)
+    {
+        SysCallReturn(pcb, -EBADF);
+        return NULL;
+    }
+    
+    // finding lowest free fd
+    int newfd = fd_alloc_lowest_free(pcb);
+    if (newfd < 0)
+    {
+        SysCallReturn(pcb, -EMFILE);
+        return NULL;
+    }
+
+    FDEntry *src = &pcb->fds[oldfd];
+    FDEntry *dst = &pcb->fds[newfd];
+
+    // copying descriptor entry
+    dst->in_use = 1;
+    dst->kind = src->kind;
+    dst->mode = src->mode;
+    dst->pipe = src->pipe;
+
+    // increasing pipe refs if needed
+    if (dst->kind == FD_PIPE && dst->pipe != NULL)
+    {
+        Pipe *p = dst->pipe;
+        P_kt_sem(p->lock);
+
+        // increasing reader refs under lock
+        if (dst->mode == FD_READ)
+            p->reader_refs++;
+        else if (dst->mode == FD_WRITE) // increasing writer refs under lock
+            p->writer_refs++;
+        else
+        {
+            V_kt_sem(p->lock); // releasing lock
+            
+            // invalid mode, so clearing fd entry -> returning error
+            dst->in_use = 0;
+            dst->kind = FD_NONE;
+            dst->mode = 0;
+            dst->pipe = NULL;
+
+            SysCallReturn(pcb, -EBADF);
+            return NULL;
+        }
+        V_kt_sem(p->lock);
+    }
+
+    // returning newfd
+    SysCallReturn(pcb, newfd);
     return NULL;
+}
+
+/*
+    - closes one fd entry inside a process (internal helper for dup2)
+    - returns 0 on success, -EBADF on invalid fd/entry
+*/
+static int close_fd_internal_for_dup2(struct PCB_struct *pcb, int fd)
+{
+    // validating pcb and fd
+    if (pcb == NULL || fd < 0 || fd >= MAX_FD || pcb->fds[fd].in_use == 0)
+        return -EBADF;
+
+    FDEntry *f = &pcb->fds[fd];
+
+    // console close, clearing slot
+    if (f->kind == FD_CONSOLE)
+    {
+        f->in_use = 0;
+        f->kind = FD_NONE;
+        f->mode = 0;
+        f->pipe = NULL;
+        return 0;
+    }
+
+    // pipe close: decrement refs and maybe wake/free
+    if (f->kind == FD_PIPE)
+    {
+        Pipe *p = f->pipe;
+
+        // error check if pipe doesn't exist
+        if (p == NULL)
+        {
+            f->in_use = 0;
+            f->kind = FD_NONE;
+            f->mode = 0;
+            f->pipe = NULL;
+            return -EBADF;
+        }
+
+        // flags
+        int became_no_writers = 0;
+        int became_no_readers = 0;
+        int free_pipe = 0;
+
+        P_kt_sem(p->lock); // lock for safe access
+
+        // decrementing reader ref count
+        if (f->mode == FD_READ)
+        {
+            if (p->reader_refs > 0) p->reader_refs--;
+            if (p->reader_refs == 0) became_no_readers = 1;
+        }
+        // decrementing writer ref count
+        else if (f->mode == FD_WRITE)
+        {
+            if (p->writer_refs > 0) p->writer_refs--;
+            if (p->writer_refs == 0) became_no_writers = 1;
+        }
+        else
+        {   
+            // invalid mode -> returning error
+            V_kt_sem(p->lock);
+            f->in_use = 0;
+            f->kind = FD_NONE;
+            f->mode = 0;
+            f->pipe = NULL;
+            return -EBADF;
+        }
+
+        if (p->reader_refs == 0 && p->writer_refs == 0)
+            free_pipe = 1;
+
+        V_kt_sem(p->lock);
+
+        // clear slot in this process
+        f->in_use = 0;
+        f->kind = FD_NONE;
+        f->mode = 0;
+        f->pipe = NULL;
+
+        // wake blocked sides if one end disappears
+        if (became_no_writers) pipe_broadcast_readers(p);
+        if (became_no_readers) pipe_broadcast_writers(p);
+
+        if (free_pipe) free(p);
+        return 0;
+    }
+
+    return -EBADF;
 }
 
 void *do_dup2(void *arg)
 {
-    (void)arg;
+    struct PCB_struct *pcb = (struct PCB_struct *)arg;
+    int oldfd = pcb->registers[5];
+    int newfd = pcb->registers[6];
+
+    // validating fd ranges
+    if (oldfd < 0 || oldfd >= MAX_FD || newfd < 0 || newfd >= MAX_FD)
+    {
+        SysCallReturn(pcb, -EBADF);
+        return NULL;
+    }
+
+    // oldfd must be open
+    if (pcb->fds[oldfd].in_use == 0)
+    {
+        SysCallReturn(pcb, -EBADF);
+        return NULL;
+    }
+
+    // dup2(x, x) is trivial
+    if (oldfd == newfd)
+    {
+        SysCallReturn(pcb, newfd);
+        return NULL;
+    }
+
+    // if newfd is open, close it first
+    if (pcb->fds[newfd].in_use)
+    {
+        int cerr = close_fd_internal_for_dup2(pcb, newfd);
+        if (cerr < 0)
+        {
+            SysCallReturn(pcb, cerr);
+            return NULL;
+        }
+    }
+    
+    FDEntry *src = &pcb->fds[oldfd];
+    FDEntry *dst = &pcb->fds[newfd];
+
+    // copying oldfd -> newfd
+    dst->in_use = 1;
+    dst->kind = src->kind;
+    dst->mode = src->mode;
+    dst->pipe = src->pipe;
+
+    // increasing pipe refs if needed
+    if (dst->kind == FD_PIPE && dst->pipe != NULL)
+    {
+        Pipe *p = dst->pipe;
+        P_kt_sem(p->lock);
+
+        // increasing reader ref count
+        if (dst->mode == FD_READ)
+            p->reader_refs++;
+        // increasing writer ref count
+        else if (dst->mode == FD_WRITE)
+            p->writer_refs++;
+        else
+        {
+            V_kt_sem(p->lock);
+            
+            // invalid mode, freeing fd entry -> returning error
+            dst->in_use = 0;
+            dst->kind = FD_NONE;
+            dst->mode = 0;
+            dst->pipe = NULL;
+            SysCallReturn(pcb, -EBADF);
+
+            return NULL;
+        }
+        V_kt_sem(p->lock);
+    }
+
+    // returning newfd
+    SysCallReturn(pcb, newfd);
     return NULL;
 }
