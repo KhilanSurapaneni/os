@@ -24,7 +24,7 @@ CFLAGS = -c -I${XCOMP}/include -G0
 #if it is not used, the linker generates too many sections of assembly
 #code and then coff2noff fails to convert the file
 
-EXECUTABLES = tests/tee_one tests/tee_two tests/tee_pipe_two_debug tests/pipe_child_read tests/unblock_fork_order tests/unblock_close_order tests/fork_exit_order tests/fork_write_fixed_order
+EXECUTABLES = tests/tee_one tests/tee_two tests/tee_pipe_two_debug tests/pipe_child_read tests/unblock_fork_order tests/unblock_close_order tests/fork_exit_order tests/fork_write_fixed_order tests/unblock_r_local tests/unblock_w_local tests/unblock_r tests/unblock_w
 
 start: all
 
@@ -76,6 +76,26 @@ tests/fork_write_fixed_order: tests/fork_write_fixed_order.o ${CRT} ${ASSIST} ${
 	${C2N} $@.coff $@
 	/bin/rm $@.coff
 
+tests/unblock_r_local: tests/unblock_r_local.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
+	${LD} ${LDFLAGS} -o $@.coff ${CRT} ${ASSIST} $@.o ${LIBS}
+	${C2N} $@.coff $@
+	/bin/rm $@.coff
+
+tests/unblock_w_local: tests/unblock_w_local.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
+	${LD} ${LDFLAGS} -o $@.coff ${CRT} ${ASSIST} $@.o ${LIBS}
+	${C2N} $@.coff $@
+	/bin/rm $@.coff
+
+tests/unblock_r: tests/unblock_r.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
+	${LD} ${LDFLAGS} -o $@.coff ${CRT} ${ASSIST} $@.o ${LIBS}
+	${C2N} $@.coff $@
+	/bin/rm $@.coff
+
+tests/unblock_w: tests/unblock_w.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
+	${LD} ${LDFLAGS} -o $@.coff ${CRT} ${ASSIST} $@.o ${LIBS}
+	${C2N} $@.coff $@
+	/bin/rm $@.coff
+
 tests/tee_one.o: tests/tee_one.c
 	${CC} ${CFLAGS} -o $@ $<
 
@@ -98,6 +118,18 @@ tests/fork_exit_order.o: tests/fork_exit_order.c
 	${CC} ${CFLAGS} -o $@ $<
 
 tests/fork_write_fixed_order.o: tests/fork_write_fixed_order.c
+	${CC} ${CFLAGS} -o $@ $<
+
+tests/unblock_r_local.o: tests/unblock_r_local.c
+	${CC} ${CFLAGS} -o $@ $<
+
+tests/unblock_w_local.o: tests/unblock_w_local.c
+	${CC} ${CFLAGS} -o $@ $<
+
+tests/unblock_r.o: tests/unblock_r.c
+	${CC} ${CFLAGS} -o $@ $<
+
+tests/unblock_w.o: tests/unblock_w.c
 	${CC} ${CFLAGS} -o $@ $<
 
 .c.o:

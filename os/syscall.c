@@ -249,6 +249,8 @@ void *do_write(void *arg)
             if (p->reader_refs == 0)
             {
                 V_kt_sem(p->lock);
+                if (written == 0)
+                    pipe_wake_one_waiter(p->blocked_writers);
                 rc = (written == 0) ? -EPIPE : written;
                 break;
             }
@@ -274,6 +276,8 @@ void *do_write(void *arg)
             if (p->reader_refs == 0)
             {
                 V_kt_sem(p->lock);
+                if (written == 0)
+                    pipe_wake_one_waiter(p->blocked_writers);
                 rc = (written == 0) ? -EPIPE : written;
                 break;
             }
@@ -472,6 +476,8 @@ void *do_read(void *arg)
             if (p->writer_refs == 0)
             {
                 V_kt_sem(p->lock);
+                if (got == 0)
+                    pipe_wake_one_waiter(p->blocked_readers);
                 rc = got;
                 break;
             }
@@ -925,7 +931,7 @@ void *do_fork(void *arg)
 */
 static void pipe_broadcast_readers(Pipe *p)
 {
-    pipe_wake_all_waiters(p->blocked_readers);
+    pipe_wake_one_waiter(p->blocked_readers);
 }
 
 /*
@@ -933,7 +939,7 @@ static void pipe_broadcast_readers(Pipe *p)
 */
 static void pipe_broadcast_writers(Pipe *p)
 {
-    pipe_wake_all_waiters(p->blocked_writers);
+    pipe_wake_one_waiter(p->blocked_writers);
 }
 
 /*
