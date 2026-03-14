@@ -11,6 +11,44 @@
 
 #define PIPE_WAKE_BROADCAST MAX_PROCS
 
+typedef struct PipeWaiter
+{
+    kt_sem sem;
+} PipeWaiter;
+
+static int pipe_push_write_record(Pipe *p, int n)
+{
+    if (n <= 0)
+        return 0;
+
+    if (p->ws_count >= PIPE_MAX_WRITES)
+        return -1;
+
+    p->write_sizes[p->ws_tail] = n;
+    p->ws_tail = (p->ws_tail + 1) % PIPE_MAX_WRITES;
+    p->ws_count++;
+    p->committed_bytes += n;
+
+    return 0;
+}
+
+static int pipe_front_write_remaining(Pipe *p)
+{
+    if (p->ws_count == 0)
+        return 0;
+
+    return p->write_sizes[p->ws_head];
+}
+
+static void pipe_pop_front_write(Pipe *p)
+{
+    if (p->ws_count == 0)
+        return;
+
+    p->ws_head = (p->ws_head + 1) % PIPE_MAX_WRITES;
+    p->ws_count--;
+}
+
 static void pipe_hold(Pipe *p)
 {
     P_kt_sem(p->lock);
@@ -29,7 +67,35 @@ static void pipe_release(Pipe *p)
     V_kt_sem(p->lock);
 
     if (free_now)
+    {
+        if (p->blocked_readers != NULL)
+            free(p->blocked_readers);
+        if (p->blocked_writers != NULL)
+            free(p->blocked_writers);
         free(p);
+    }
+}
+
+static void pipe_enqueue_waiter(Dllist q, PipeWaiter *w)
+{
+    dll_append(q, new_jval_v((void *)w));
+}
+
+static void pipe_wake_one_waiter(Dllist q)
+{
+    if (q == NULL || dll_empty(q))
+        return;
+
+    Dllist n = dll_first(q);
+    PipeWaiter *w = (PipeWaiter *)jval_v(dll_val(n));
+    dll_delete_node(n);
+    V_kt_sem(w->sem);
+}
+
+static void pipe_wake_all_waiters(Dllist q)
+{
+    while (q != NULL && !dll_empty(q))
+        pipe_wake_one_waiter(q);
 }
 
 /*
@@ -116,6 +182,9 @@ void *do_write(void *arg)
         Pipe *p = f->pipe;
         int written = 0;
         int rc = 0;
+        PipeWaiter writer_waiter;
+        int writer_waiter_init = 0;
+        int writer_waiter_queued = 0;
 
         // marks this pipe as active so it does not get freed while this
         // write() system call is still using it
@@ -134,21 +203,28 @@ void *do_write(void *arg)
                 rc = (written == 0) ? -EPIPE : written;
                 break;
             }
-            V_kt_sem(p->lock);
-
-            // wait for one free byte in pipe
-            P_kt_sem(p->space_sem);
-
-            // re-lock before modifying buffer vars
-            P_kt_sem(p->lock);
+            if (p->count >= PIPE_BUF_SIZE)
+            {
+                if (!writer_waiter_init)
+                {
+                    writer_waiter.sem = make_kt_sem(0);
+                    writer_waiter_init = 1;
+                }
+                if (!writer_waiter_queued)
+                {
+                    pipe_enqueue_waiter(p->blocked_writers, &writer_waiter);
+                    writer_waiter_queued = 1;
+                }
+                V_kt_sem(p->lock);
+                P_kt_sem(writer_waiter.sem);
+                writer_waiter_queued = 0;
+                continue;
+            }
 
             // check if readers disappeared while blocked
             if (p->reader_refs == 0)
             {
                 V_kt_sem(p->lock);
-                // Give back the space token we consumed.
-                V_kt_sem(p->space_sem);
-
                 rc = (written == 0) ? -EPIPE : written;
                 break;
             }
@@ -160,9 +236,24 @@ void *do_write(void *arg)
 
             // unlock pipe
             V_kt_sem(p->lock);
-            V_kt_sem(p->data_sem);
 
             written++; // update local progress
+        }
+
+        if (written > 0)
+        {
+            P_kt_sem(p->lock);
+            if (pipe_push_write_record(p, written) < 0)
+            {
+                V_kt_sem(p->lock);
+                rc = -EIO;
+                V_kt_sem(p->writer_sem);
+                pipe_release(p);
+                SysCallReturn(pcb, rc);
+                return NULL;
+            }
+            V_kt_sem(p->lock);
+            pipe_wake_one_waiter(p->blocked_readers);
         }
 
         // returning success unless the loop broke on a pipe error/EOF case
@@ -171,6 +262,9 @@ void *do_write(void *arg)
 
         // release writer block
         V_kt_sem(p->writer_sem);
+
+        if (writer_waiter_init)
+            kill_kt_sem(writer_waiter.sem);
 
         // marks this pipe as no longer active for this write() path
         pipe_release(p);
@@ -270,6 +364,9 @@ void *do_read(void *arg)
         Pipe *p = f->pipe;
         int got = 0; // local counter
         int rc = 0;
+        PipeWaiter reader_waiter;
+        int reader_waiter_init = 0;
+        int reader_waiter_queued = 0;
 
         // marks this pipe as active so it does not get freed while this
         // read() system call is still using it
@@ -277,48 +374,79 @@ void *do_read(void *arg)
 
         while (got < n)
         {
-            // consume available data
             P_kt_sem(p->lock);
-            if (p->count > 0) // check if buffer has bytes
-            {
-                kbuf[got] = p->buf[p->head]; // copy from pipe to user buffer
-                p->head = (p->head + 1) % PIPE_BUF_SIZE; // move head forward
-                p->count--; // decrement count
-                got++; // increment local counter
-                V_kt_sem(p->lock); // unlock
-                V_kt_sem(p->space_sem); // unlock
-                continue;
-            }
 
-            // empty pipe, If no writers remain, EOF.
-            if (p->writer_refs == 0)
+            // Only consume bytes that belong to completed write() calls.
+            if (p->committed_bytes > 0 && p->ws_count > 0)
             {
+                int freed = 0;
+
+                while (got < n && p->committed_bytes > 0 && p->ws_count > 0)
+                {
+                    int remaining = pipe_front_write_remaining(p);
+
+                    while (got < n && remaining > 0)
+                    {
+                        kbuf[got] = p->buf[p->head];
+                        p->head = (p->head + 1) % PIPE_BUF_SIZE;
+                        p->count--;
+                        p->committed_bytes--;
+                        got++;
+                        freed++;
+                        remaining--;
+                    }
+
+                    if (remaining == 0)
+                    {
+                        pipe_pop_front_write(p);
+                    }
+                    else
+                    {
+                        p->write_sizes[p->ws_head] = remaining;
+                        break;
+                    }
+                }
+
                 V_kt_sem(p->lock);
-                rc = got; // may be 0
+                while (freed > 0)
+                {
+                    pipe_wake_one_waiter(p->blocked_writers);
+                    freed--;
+                }
+
+                rc = got;
                 break;
             }
 
-            // writers exist, but no data now
-            if (got > 0)
+            // Empty pipe and no writers means EOF. If we already copied some
+            // bytes, return them; otherwise return 0 immediately.
+            if (p->writer_refs == 0)
             {
-                // do not block trying to fill the full n
                 V_kt_sem(p->lock);
                 rc = got;
                 break;
             }
 
-            // unlock
+            if (!reader_waiter_init)
+            {
+                reader_waiter.sem = make_kt_sem(0);
+                reader_waiter_init = 1;
+            }
+            if (!reader_waiter_queued)
+            {
+                pipe_enqueue_waiter(p->blocked_readers, &reader_waiter);
+                reader_waiter_queued = 1;
+            }
             V_kt_sem(p->lock);
-
-            // no data yet, writers still alive: block for one byte
-            P_kt_sem(p->data_sem);
-
-            // loop and re-check under lock
+            P_kt_sem(reader_waiter.sem);
+            reader_waiter_queued = 0;
         }
 
-        // full request satisfied
         if (got == n)
             rc = got;
+
+        if (reader_waiter_init)
+            kill_kt_sem(reader_waiter.sem);
 
         // marks this pipe as no longer active for this read() path
         pipe_release(p);
@@ -765,10 +893,7 @@ void *do_fork(void *arg)
 */
 static void pipe_broadcast_readers(Pipe *p)
 {
-    int i;
-    for (i = 0; i < PIPE_WAKE_BROADCAST; i++) {
-        V_kt_sem(p->data_sem);   // wake readers blocked on empty pipe
-    }
+    pipe_wake_all_waiters(p->blocked_readers);
 }
 
 /*
@@ -776,10 +901,7 @@ static void pipe_broadcast_readers(Pipe *p)
 */
 static void pipe_broadcast_writers(Pipe *p)
 {
-    int i;
-    for (i = 0; i < PIPE_WAKE_BROADCAST; i++) {
-        V_kt_sem(p->space_sem);  // wake writers blocked on full pipe
-    }
+    pipe_wake_all_waiters(p->blocked_writers);
 }
 
 /*
@@ -1103,6 +1225,10 @@ static Pipe *pipe_create(void)
 
     // zero bytes in pipe initially
     p->count = 0;
+    p->committed_bytes = 0;
+    p->ws_head = 0;
+    p->ws_tail = 0;
+    p->ws_count = 0;
 
     // only one read and write FD right now
     p->reader_refs = 1;
@@ -1113,8 +1239,11 @@ static Pipe *pipe_create(void)
 
     p->lock = make_kt_sem(1); // starts unlocked
     p->data_sem = make_kt_sem(0); // no bytes available for readers yet to read, signals for readers to block
+    p->record_sem = make_kt_sem(0); // no completed write() records available initially
     p->space_sem = make_kt_sem(PIPE_BUF_SIZE); // all slots are free initially, writers can write to full capacity
     p->writer_sem = make_kt_sem(1); // only 1 writer allowed at a time, no writers currently
+    p->blocked_readers = new_dllist();
+    p->blocked_writers = new_dllist();
 
     return p;
 }

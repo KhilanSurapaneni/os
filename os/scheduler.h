@@ -10,6 +10,7 @@
 #define MAX_PROCS 8
 #define MAX_FD 64
 #define PIPE_BUF_SIZE (8*1024)
+#define PIPE_MAX_WRITES PIPE_BUF_SIZE
 
 /*
     -   tells what an FD points to
@@ -41,6 +42,13 @@ typedef struct Pipe
     int head; // index of next byte to read
     int tail; // index of next slot to write
     int count; // how many bytes are stored in buf
+    int committed_bytes; // bytes that belong to completed write() calls
+
+    // FIFO of completed write() sizes so reads can preserve write boundaries.
+    int write_sizes[PIPE_MAX_WRITES];
+    int ws_head;
+    int ws_tail;
+    int ws_count;
 
     // how many FDs still reference each end
     int reader_refs; // number of open read-end FDs pointing to this pipe.
@@ -49,8 +57,11 @@ typedef struct Pipe
 
     kt_sem lock; // mutex around pipe
     kt_sem data_sem; // readers wait here when pipe is empty
+    kt_sem record_sem; // readers wait here for a completed write() record
     kt_sem space_sem; // writers wait here when pipe is full
     kt_sem writer_sem; // blocking so the whole write() call can happen
+    Dllist blocked_readers; // FIFO queue of blocked pipe readers
+    Dllist blocked_writers; // FIFO queue of blocked pipe writers
 } Pipe;
 
 /*

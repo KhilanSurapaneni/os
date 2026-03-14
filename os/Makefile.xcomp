@@ -24,7 +24,7 @@ CFLAGS = -c -I${XCOMP}/include -G0
 #if it is not used, the linker generates too many sections of assembly
 #code and then coff2noff fails to convert the file
 
-EXECUTABLES = simple_exit
+EXECUTABLES = tests/tee_one tests/tee_two tests/tee_pipe_two_debug tests/pipe_child_read
 
 start: all
 
@@ -36,10 +36,37 @@ CFLAGS = -c -I/usr/include -I${XCOMP}/include -G0
 #if it is not used, the linker generates too many sections of assembly
 #code and then coff2noff fails to convert the file
 
-simple_exit: simple_exit.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
+tests/tee_one: tests/tee_one.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
 	${LD} ${LDFLAGS} -o $@.coff ${CRT} ${ASSIST} $@.o ${LIBS}
 	${C2N} $@.coff $@
 	/bin/rm $@.coff
+
+tests/pipe_child_read: tests/pipe_child_read.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
+	${LD} ${LDFLAGS} -o $@.coff ${CRT} ${ASSIST} $@.o ${LIBS}
+	${C2N} $@.coff $@
+	/bin/rm $@.coff
+
+tests/tee_two: tests/tee_two.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
+	${LD} ${LDFLAGS} -o $@.coff ${CRT} ${ASSIST} $@.o ${LIBS}
+	${C2N} $@.coff $@
+	/bin/rm $@.coff
+
+tests/tee_pipe_two_debug: tests/tee_pipe_two_debug.o ${CRT} ${ASSIST} ${LIBSYS} ${LIBC}
+	${LD} ${LDFLAGS} -o $@.coff ${CRT} ${ASSIST} $@.o ${LIBS}
+	${C2N} $@.coff $@
+	/bin/rm $@.coff
+
+tests/tee_one.o: tests/tee_one.c
+	${CC} ${CFLAGS} -o $@ $<
+
+tests/tee_two.o: tests/tee_two.c
+	${CC} ${CFLAGS} -o $@ $<
+
+tests/tee_pipe_two_debug.o: tests/tee_pipe_two_debug.c
+	${CC} ${CFLAGS} -o $@ $<
+
+tests/pipe_child_read.o: tests/pipe_child_read.c
+	${CC} ${CFLAGS} -o $@ $<
 
 .c.o:
 	${CC} ${CFLAGS} $*.c
