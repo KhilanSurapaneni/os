@@ -16,6 +16,9 @@ void KOS(void)
     // write sempahores
     writeok = make_kt_sem(0);
     writers = make_kt_sem(1);
+    console_writer_state_lock = make_kt_sem(1);
+    console_writer_q = new_dllist();
+    console_writer_busy = 0;
 
     // read semaphores
     consoleWait = make_kt_sem(0);

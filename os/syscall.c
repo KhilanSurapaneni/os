@@ -16,6 +16,11 @@ typedef struct PipeWaiter
     kt_sem sem;
 } PipeWaiter;
 
+typedef struct ConsoleWriterWaiter
+{
+    kt_sem sem;
+} ConsoleWriterWaiter;
+
 static int pipe_push_write_record(Pipe *p, int n)
 {
     if (n <= 0)
@@ -98,6 +103,13 @@ static void pipe_wake_all_waiters(Dllist q)
         pipe_wake_one_waiter(q);
 }
 
+static void *FinishFork(void *arg)
+{
+    struct PCB_struct *child = (struct PCB_struct *)arg;
+    SysCallReturn(child, 0);
+    return NULL;
+}
+
 /*
     - output to console
 */
@@ -150,7 +162,27 @@ void *do_write(void *arg)
             return NULL;
         }
 
-        // block writer
+        ConsoleWriterWaiter waiter;
+        int waiter_init = 0;
+
+        // Preserve FIFO order among console writers explicitly instead of
+        // relying on kt_sem wake ordering.
+        P_kt_sem(console_writer_state_lock);
+        if (console_writer_busy || !dll_empty(console_writer_q))
+        {
+            waiter.sem = make_kt_sem(0);
+            waiter_init = 1;
+            dll_append(console_writer_q, new_jval_v((void *)&waiter));
+            V_kt_sem(console_writer_state_lock);
+            P_kt_sem(waiter.sem);
+        }
+        else
+        {
+            console_writer_busy = 1;
+            V_kt_sem(console_writer_state_lock);
+        }
+
+        // Keep the existing writer semaphore as the actual device exclusion.
         P_kt_sem(writers);
         int written = 0;
 
@@ -164,6 +196,23 @@ void *do_write(void *arg)
 
         // release writer block
         V_kt_sem(writers);
+
+        P_kt_sem(console_writer_state_lock);
+        if (!dll_empty(console_writer_q))
+        {
+            Dllist n = dll_first(console_writer_q);
+            ConsoleWriterWaiter *next = (ConsoleWriterWaiter *)jval_v(dll_val(n));
+            dll_delete_node(n);
+            V_kt_sem(next->sem);
+        }
+        else
+        {
+            console_writer_busy = 0;
+        }
+        V_kt_sem(console_writer_state_lock);
+
+        if (waiter_init)
+            kill_kt_sem(waiter.sem);
 
         SysCallReturn(pcb, written);
         return NULL;
@@ -790,21 +839,6 @@ void *do_getpid(void *arg)
 }
 
 /*
-    - helper function because parent and child need different return values from same syscall
-    - parent returns in do_fork
-    - child returns here
-*/
-static void *FinishFork(void *arg)
-{
-    struct PCB_struct *child = (struct PCB_struct *)arg;
-
-    // child sees fork return 0
-    SysCallReturn(child, 0);
-
-    return NULL;
-}
-
-/*
     - creates a child process by cloning the current one
 */
 void *do_fork(void *arg)
@@ -880,9 +914,7 @@ void *do_fork(void *arg)
         V_kt_sem(p->lock);
     }
 
-    // making the child return from the fork later
-    kt_fork(FinishFork, child);
-
+    kt_fork(FinishFork, (void *)child);
     SysCallReturn(parent, child->pid);
 
     return NULL;

@@ -9,6 +9,9 @@
 // write semaphores
 kt_sem writeok;
 kt_sem writers;
+kt_sem console_writer_state_lock;
+Dllist console_writer_q;
+int console_writer_busy;
 
 // read semaphores
 kt_sem consoleWait;
