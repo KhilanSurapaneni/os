@@ -320,7 +320,7 @@ void SysCallReturn(struct PCB_struct *pcb, int return_val)
     // putting the return value in r2
     pcb->registers[2] = return_val;
 
-    // put the process back on the ready queue
+    // put the process on the back of the ready queue
     dll_append(readyq, new_jval_v((void *)pcb));
 
     // syscallreturn code goes here

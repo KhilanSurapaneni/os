@@ -26,7 +26,6 @@ void exceptionHandler(ExceptionType which)
 	switch (which)
 	{
 	case SyscallException:
-
 		if (Current_pcb == NULL)
 		{
 			DEBUG('e', "Unknown system call %d\n", type);
@@ -189,7 +188,7 @@ void interruptHandler(IntType which)
 		V_kt_sem(writeok); // signals that console finished writing a character
 		break;
 	case TimerInt:
-		DEBUG('e', "TimerInt interrupt\n");
+		// DEBUG('e', "TimerInt interrupt\n");
 		break;
 	default:
 		DEBUG('e', "Unknown interrupt\n");

@@ -19,6 +19,7 @@ kt_sem nslots;
 static int cbuf[CBUF_SIZE];
 static int head = 0; // next item to remove
 static int tail = 0; // next slot to insert
+static int eof_pending = 0; // says the next console read should return EOF
 
 /*
     - reads console for input
@@ -105,6 +106,13 @@ int ConsoleBufGetChar(void)
 {
     int ch;
 
+    // if EOF was deferred from a previous read(), return it now
+    if (eof_pending)
+    {
+        eof_pending = 0;
+        return -1;
+    }
+
     // wait until there is at least 1 element
     P_kt_sem(nelem);
 
@@ -116,4 +124,12 @@ int ConsoleBufGetChar(void)
     V_kt_sem(nslots);
 
     return ch;
+}
+
+/*
+    - defers EOF so the next console read sees it
+*/
+void ConsoleBufSetEOFPending(void)
+{
+    eof_pending = 1;
 }

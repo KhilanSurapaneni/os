@@ -11,6 +11,27 @@
 
 #define PIPE_WAKE_BROADCAST MAX_PROCS
 
+static void pipe_hold(Pipe *p)
+{
+    P_kt_sem(p->lock);
+    p->active_ops++;
+    V_kt_sem(p->lock);
+}
+
+static void pipe_release(Pipe *p)
+{
+    int free_now = 0;
+
+    P_kt_sem(p->lock);
+    p->active_ops--;
+    if (p->active_ops == 0 && p->reader_refs == 0 && p->writer_refs == 0)
+        free_now = 1;
+    V_kt_sem(p->lock);
+
+    if (free_now)
+        free(p);
+}
+
 /*
     - output to console
 */
@@ -92,9 +113,16 @@ void *do_write(void *arg)
             return NULL;
         }
 
-
         Pipe *p = f->pipe;
         int written = 0;
+        int rc = 0;
+
+        // marks this pipe as active so it does not get freed while this
+        // write() system call is still using it
+        pipe_hold(p);
+
+        // blocking so the whole write() call can happen
+        P_kt_sem(p->writer_sem);
 
         while (written < n)
         {
@@ -103,11 +131,8 @@ void *do_write(void *arg)
             if (p->reader_refs == 0)
             {
                 V_kt_sem(p->lock);
-                if (written == 0)
-                    SysCallReturn(pcb, -EBADF);
-                else
-                    SysCallReturn(pcb, written);
-                return NULL;
+                rc = (written == 0) ? -EPIPE : written;
+                break;
             }
             V_kt_sem(p->lock);
 
@@ -124,11 +149,8 @@ void *do_write(void *arg)
                 // Give back the space token we consumed.
                 V_kt_sem(p->space_sem);
 
-                if (written == 0)
-                    SysCallReturn(pcb, -EBADF);
-                else
-                    SysCallReturn(pcb, written);
-                return NULL;
+                rc = (written == 0) ? -EPIPE : written;
+                break;
             }
             
             // write one byte into pipe buffer
@@ -143,7 +165,17 @@ void *do_write(void *arg)
             written++; // update local progress
         }
 
-        SysCallReturn(pcb, written);
+        // returning success unless the loop broke on a pipe error/EOF case
+        if (written == n)
+            rc = written;
+
+        // release writer block
+        V_kt_sem(p->writer_sem);
+
+        // marks this pipe as no longer active for this write() path
+        pipe_release(p);
+
+        SysCallReturn(pcb, rc);
         return NULL;
     }
 
@@ -209,7 +241,13 @@ void *do_read(void *arg)
         {
             int ch = ConsoleBufGetChar(); // blocks if empty
             if (ch == -1) // CTRL-D / EOF
+            {
+                // if some bytes were already read, defer EOF to the next
+                // read() so this one can return the buffered bytes first
+                if (i > 0)
+                    ConsoleBufSetEOFPending();
                 break;
+            }
             kbuf[i] = (char)ch;
             i++;
         }
@@ -231,6 +269,11 @@ void *do_read(void *arg)
 
         Pipe *p = f->pipe;
         int got = 0; // local counter
+        int rc = 0;
+
+        // marks this pipe as active so it does not get freed while this
+        // read() system call is still using it
+        pipe_hold(p);
 
         while (got < n)
         {
@@ -251,8 +294,8 @@ void *do_read(void *arg)
             if (p->writer_refs == 0)
             {
                 V_kt_sem(p->lock);
-                SysCallReturn(pcb, got); // may be 0
-                return NULL;
+                rc = got; // may be 0
+                break;
             }
 
             // writers exist, but no data now
@@ -260,8 +303,8 @@ void *do_read(void *arg)
             {
                 // do not block trying to fill the full n
                 V_kt_sem(p->lock);
-                SysCallReturn(pcb, got);
-                return NULL;
+                rc = got;
+                break;
             }
 
             // unlock
@@ -273,7 +316,14 @@ void *do_read(void *arg)
             // loop and re-check under lock
         }
 
-        SysCallReturn(pcb, got);
+        // full request satisfied
+        if (got == n)
+            rc = got;
+
+        // marks this pipe as no longer active for this read() path
+        pipe_release(p);
+
+        SysCallReturn(pcb, rc);
         return NULL;
     }
 
@@ -293,8 +343,17 @@ void *do_ioctl(void *arg)
     int req = pcb->registers[6];    // arg2 (request code)
     int addr_u = pcb->registers[7]; // arg3 (user address of struct)
 
-    // only support ioctl(1, JOS_TCGETP, termios*)
-    if (fd != 1 || req != JOS_TCGETP)
+    // validating fd range + making sure fd is not in use
+    if (fd < 0 || fd >= MAX_FD || pcb->fds[fd].in_use == 0)
+    {
+        SysCallReturn(pcb, -EBADF);
+        return NULL;
+    }
+
+    FDEntry *f = &pcb->fds[fd];
+
+    // only support ioctl() on console-backed descriptors
+    if (f->kind != FD_CONSOLE || req != JOS_TCGETP)
     {
         SysCallReturn(pcb, -EINVAL);
         return NULL;
@@ -336,8 +395,17 @@ void *do_fstat(void *arg)
     int fd = pcb->registers[5];     // arg1 (fd)
     int stat_u = pcb->registers[6]; // arg2 (user addr of struct KOSstat)
 
-    // only support fstat on stdin/stdout/stderr
-    if (fd != 0 && fd != 1 && fd != 2)
+    // validating fd range + making sure fd is not in use
+    if (fd < 0 || fd >= MAX_FD || pcb->fds[fd].in_use == 0)
+    {
+        SysCallReturn(pcb, -EBADF);
+        return NULL;
+    }
+
+    FDEntry *f = &pcb->fds[fd];
+
+    // only support fstat on console-backed descriptors
+    if (f->kind != FD_CONSOLE)
     {
         SysCallReturn(pcb, -EBADF);
         return NULL;
@@ -357,8 +425,8 @@ void *do_fstat(void *arg)
         return NULL;
     }
 
-    // choose buffering size per cookbook
-    int blk_size = (fd == 0) ? 1 : 256;
+    // choose buffering size
+    int blk_size = (f->mode == FD_READ) ? 1 : 256;
 
     // translate user addr to simulator memory
     struct KOSstat *kstat = (struct KOSstat *)U2K(pcb, stat_u);
@@ -781,7 +849,8 @@ static int close_fd_internal(struct PCB_struct *pcb, int fd)
             return -EBADF;
         }
 
-        if (p->reader_refs == 0 && p->writer_refs == 0)
+        // only free pipe if no refs and active ops remain
+        if (p->reader_refs == 0 && p->writer_refs == 0 && p->active_ops == 0)
             free_pipe = 1;
 
         V_kt_sem(p->lock);
@@ -1039,9 +1108,13 @@ static Pipe *pipe_create(void)
     p->reader_refs = 1;
     p->writer_refs = 1;
 
+    // no active operations initially
+    p->active_ops = 0;
+
     p->lock = make_kt_sem(1); // starts unlocked
     p->data_sem = make_kt_sem(0); // no bytes available for readers yet to read, signals for readers to block
     p->space_sem = make_kt_sem(PIPE_BUF_SIZE); // all slots are free initially, writers can write to full capacity
+    p->writer_sem = make_kt_sem(1); // only 1 writer allowed at a time, no writers currently
 
     return p;
 }

@@ -9,7 +9,7 @@
 
 #define MAX_PROCS 8
 #define MAX_FD 64
-#define PIPE_BUF_SIZE 256
+#define PIPE_BUF_SIZE (8*1024)
 
 /*
     -   tells what an FD points to
@@ -45,11 +45,12 @@ typedef struct Pipe
     // how many FDs still reference each end
     int reader_refs; // number of open read-end FDs pointing to this pipe.
     int writer_refs; // number of open write-end FDs pointing to this pipe.
-
+    int active_ops;  // number of do_read/do_write paths currently using p
 
     kt_sem lock; // mutex around pipe
     kt_sem data_sem; // readers wait here when pipe is empty
     kt_sem space_sem; // writers wait here when pipe is full
+    kt_sem writer_sem; // blocking so the whole write() call can happen
 } Pipe;
 
 /*

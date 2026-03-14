@@ -16,5 +16,6 @@ void *ConsoleReader(void *arg);
 void DumpConsoleBuffer(void);
 
 int ConsoleBufGetChar(void);
+void ConsoleBufSetEOFPending(void);
 
 #endif
